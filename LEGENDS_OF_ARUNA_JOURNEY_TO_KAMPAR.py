@@ -9,9 +9,9 @@ Telegram Turn-Based Text RPG
 - Banyak konten dari GDD sudah disusun sebagai data, tapi kamu bebas menambah/merapikan.
 
 Cara pakai (singkat):
-1. pip install python-telegram-bot==20.7
-2. Isi TOKEN_BOT di bawah.
-3. Jalankan: python legends_of_aruna_bot.py
+1. pip install python-telegram-bot==20.7 python-dotenv
+2. Buat file .env berisi TELEGRAM_BOT_TOKEN (dan ADMIN_USER_IDS bila perlu).
+3. Jalankan: python LEGENDS_OF_ARUNA_JOURNEY_TO_KAMPAR.py
 4. Chat bot di Telegram, pakai /start
 
 NB: Untuk produksi, sebaiknya simpan state di database, bukan di memory seperti contoh ini.
@@ -40,12 +40,25 @@ from telegram.ext import (
     filters,
 )
 
+from dotenv import load_dotenv
+
 # ==========================
 # KONFIGURASI
 # ==========================
 
-TOKEN_BOT = "8565685476:AAEX1AaCELoIJkhisYSN3jJ8zapKKRL6xZc"  # <--- Ganti dengan token bot dari BotFather
-ADMIN_USER_IDS = [123456789]  # <--- Ganti dengan daftar ID Telegram admin/developer
+load_dotenv()
+
+TOKEN_BOT = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN_BOT:
+    raise ValueError(
+        "TELEGRAM_BOT_TOKEN belum diset di environment. Tambahkan ke .env atau environment."
+    )
+
+raw_admin_ids = os.getenv("ADMIN_USER_IDS")
+if raw_admin_ids:
+    ADMIN_USER_IDS = [int(item.strip()) for item in raw_admin_ids.split(",") if item.strip()]
+else:
+    ADMIN_USER_IDS = [123456789]
 
 LOG_LEVEL = logging.INFO
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
