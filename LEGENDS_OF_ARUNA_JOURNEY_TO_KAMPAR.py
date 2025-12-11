@@ -40,6 +40,33 @@ from telegram.ext import (
     filters,
 )
 
+from advanced_features import (
+    AchievementPlugin,
+    DailyChallengeManager,
+    EnemyAI,
+    EventBus,
+    EventManager,
+    EventType,
+    GameEvent,
+    HybridStorage,
+    LeaderboardManager,
+    PluginManager,
+    PerformanceMonitor,
+    ScheduledTaskManager,
+    StatisticsTracker,
+    StatusEffect,
+    StatusEffectManager,
+    StatusType,
+    TaskQueue,
+    WEAPON_UPGRADE_RULES,
+    WeaponAffinity,
+    WeaponUpgrade,
+    CRAFTING_RECIPES,
+    calculate_party_synergies,
+    can_craft,
+    craft_item,
+    perform_weapon_upgrade,
+)
 from auto_hunt import AutoHuntSession
 from config import (
     AUTO_HUNT_RATE_LIMIT,
@@ -96,6 +123,22 @@ AUTOSAVE_BOSS_KEYS = {
 AUTOSAVE_NOTICE_TEXT = "Progress otomatis disimpan."
 PENDING_AUTOSAVE_FLAG = "_PENDING_AUTOSAVE"
 UNKNOWN_CALLBACK_MESSAGE = "Perintah ini tidak dikenal. Coba tekan menu lagi."
+
+
+EVENT_BUS = EventBus()
+PLUGIN_MANAGER = PluginManager(EVENT_BUS)
+ACHIEVEMENT_PLUGIN = AchievementPlugin()
+STATISTICS_PLUGIN = StatisticsTracker()
+PLUGIN_MANAGER.load_plugin(ACHIEVEMENT_PLUGIN)
+PLUGIN_MANAGER.load_plugin(STATISTICS_PLUGIN)
+
+LEADERBOARD_MANAGER = LeaderboardManager()
+DAILY_CHALLENGE_MANAGER = DailyChallengeManager(LEADERBOARD_MANAGER)
+EVENT_MANAGER = EventManager()
+PERFORMANCE_MONITOR = PerformanceMonitor()
+TASK_QUEUE = TaskQueue()
+SCHEDULER = ScheduledTaskManager(TASK_QUEUE, DAILY_CHALLENGE_MANAGER)
+HYBRID_STORAGE = HybridStorage()
 
 
 async def safe_edit_text(
@@ -1496,6 +1539,9 @@ class CharacterState:
     skills: List[str] = field(default_factory=list)
     weapon_id: Optional[str] = None
     armor_id: Optional[str] = None
+    equipment_upgrades: Dict[str, WeaponUpgrade] = field(default_factory=dict)
+    weapon_affinity: Dict[str, WeaponAffinity] = field(default_factory=dict)
+    temporary_bonuses: Dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1514,6 +1560,25 @@ class CharacterState:
             "skills": list(self.skills),
             "weapon_id": self.weapon_id,
             "armor_id": self.armor_id,
+            "equipment_upgrades": {
+                item: {
+                    "level": up.level,
+                    "bonus_stats": dict(up.bonus_stats),
+                    "base_success_rate": up.base_success_rate,
+                }
+                if isinstance(up, WeaponUpgrade)
+                else dict(up)
+                for item, up in self.equipment_upgrades.items()
+            },
+            "weapon_affinity": {
+                item: {
+                    "kills_with_weapon": affinity.kills_with_weapon,
+                    "mastery_level": affinity.mastery_level,
+                }
+                if isinstance(affinity, WeaponAffinity)
+                else dict(affinity)
+                for item, affinity in self.weapon_affinity.items()
+            },
         }
 
     @classmethod
@@ -1534,6 +1599,21 @@ class CharacterState:
             skills=list(data.get("skills", [])),
             weapon_id=data.get("weapon_id"),
             armor_id=data.get("armor_id"),
+            equipment_upgrades={
+                item: WeaponUpgrade(
+                    level=info.get("level", 0),
+                    bonus_stats=info.get("bonus_stats", {}),
+                    base_success_rate=info.get("base_success_rate", 0.8),
+                )
+                for item, info in (data.get("equipment_upgrades", {}) or {}).items()
+            },
+            weapon_affinity={
+                item: WeaponAffinity(
+                    kills_with_weapon=info.get("kills_with_weapon", 0),
+                    mastery_level=info.get("mastery_level", 0),
+                )
+                for item, info in (data.get("weapon_affinity", {}) or {}).items()
+            },
         )
 
 
@@ -1612,6 +1692,9 @@ class GameState:
     inventory: Dict[str, int] = field(default_factory=dict)
     xp_pool: Dict[str, int] = field(default_factory=dict)
     flags: Dict[str, Any] = field(default_factory=dict)
+    equipment_upgrades: Dict[str, WeaponUpgrade] = field(default_factory=dict)
+    weapon_affinity: Dict[str, WeaponAffinity] = field(default_factory=dict)
+    active_world_events: List[Dict[str, Any]] = field(default_factory=list)
     return_scene_after_battle: Optional[str] = None
     loss_scene_after_battle: Optional[str] = None
     auto_hunt: bool = False
@@ -1620,6 +1703,10 @@ class GameState:
     quests_active: Dict[str, QuestState] = field(default_factory=dict)
     quests_completed: List[QuestState] = field(default_factory=list)
     battle_snapshot: BattleSnapshot = field(default_factory=BattleSnapshot)
+    daily_challenge_id: Optional[str] = None
+    daily_score: int = 0
+    version: int = 2
+    status_manager: StatusEffectManager = field(default_factory=StatusEffectManager)
     profile: PlayerProfile = field(init=False)
     inventory_model: Inventory = field(init=False)
     quest_log: QuestLog = field(init=False)
@@ -1702,6 +1789,7 @@ class GameState:
             "QUEST_WEAPON_DONE": False,
             "WEAPON_QUEST_STARTED": False,
             "WEAPON_QUEST_DONE": False,
+            "SYNERGY_BONUSES": {},
         }
         for key, value in default_flags.items():
             self.flags.setdefault(key, value)
@@ -1732,12 +1820,35 @@ class GameState:
             "inventory": dict(self.inventory),
             "xp_pool": dict(self.xp_pool),
             "flags": safe_flags,
+            "equipment_upgrades": {
+                item: {
+                    "level": up.level,
+                    "bonus_stats": dict(up.bonus_stats),
+                    "base_success_rate": up.base_success_rate,
+                }
+                if isinstance(up, WeaponUpgrade)
+                else dict(up)
+                for item, up in self.equipment_upgrades.items()
+            },
+            "weapon_affinity": {
+                item: {
+                    "kills_with_weapon": affinity.kills_with_weapon,
+                    "mastery_level": affinity.mastery_level,
+                }
+                if isinstance(affinity, WeaponAffinity)
+                else dict(affinity)
+                for item, affinity in self.weapon_affinity.items()
+            },
+            "active_world_events": list(self.active_world_events),
             "auto_hunt": self.auto_hunt,
             "auto_hunt_area": self.auto_hunt_area,
             "quests_active": {
                 qid: quest.to_dict() for qid, quest in self.quests_active.items()
             },
             "quests_completed": [quest.to_dict() for quest in self.quests_completed],
+            "daily_challenge_id": self.daily_challenge_id,
+            "daily_score": self.daily_score,
+            "version": self.version,
         }
 
     @classmethod
@@ -1764,6 +1875,21 @@ class GameState:
         for cid in state.party_order:
             state.xp_pool.setdefault(cid, 0)
         state.flags = data.get("flags", {})
+        state.equipment_upgrades = {
+            item: WeaponUpgrade(
+                level=info.get("level", 0),
+                bonus_stats=info.get("bonus_stats", {}),
+                base_success_rate=info.get("base_success_rate", 0.8),
+            )
+            for item, info in (data.get("equipment_upgrades", {}) or {}).items()
+        }
+        state.weapon_affinity = {
+            item: WeaponAffinity(
+                kills_with_weapon=info.get("kills_with_weapon", 0),
+                mastery_level=info.get("mastery_level", 0),
+            )
+            for item, info in (data.get("weapon_affinity", {}) or {}).items()
+        }
         state.ensure_flag_defaults()
         state.auto_hunt = False
         state.auto_hunt_area = None
@@ -1784,6 +1910,10 @@ class GameState:
         state.battle_state = BattleTurnState()
         state.return_scene_after_battle = None
         state.loss_scene_after_battle = None
+        state.active_world_events = data.get("active_world_events", [])
+        state.daily_challenge_id = data.get("daily_challenge_id")
+        state.daily_score = int(data.get("daily_score", 0))
+        state.version = int(data.get("version", 1))
         if not state.player_name:
             hero = state.party.get("ARUNA")
             if hero:
@@ -1830,11 +1960,16 @@ class GameState:
         self.inventory = {}
         self.xp_pool = {}
         self.flags = {}
+        self.equipment_upgrades = {}
+        self.weapon_affinity = {}
         self.auto_hunt = False
         self.auto_hunt_area = None
         self.auto_hunt_stats = {}
         self.quests_active = {}
         self.quests_completed = []
+        self.active_world_events = []
+        self.daily_challenge_id = None
+        self.daily_score = 0
         self.ensure_flag_defaults()
         self.ensure_aruna()
 
@@ -1916,6 +2051,7 @@ def save_game_state(user_id: int, state: "GameState") -> bool:
     path = get_save_path(user_id)
     payload = serialize_game_state(state)
     success = safe_save_json(path, payload)
+    HYBRID_STORAGE.save_state_sync(user_id, payload)
     if not success:
         logger.error("Gagal menyimpan progress user %s secara aman", user_id)
     return success
@@ -1924,6 +2060,8 @@ def save_game_state(user_id: int, state: "GameState") -> bool:
 def load_game_state(user_id: int) -> Optional["GameState"]:
     path = get_save_path(user_id)
     data = safe_load_json(path)
+    if not data:
+        data = HYBRID_STORAGE.load_state_sync(user_id)
     if not data:
         return None
     try:
@@ -1999,6 +2137,13 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
     return SESSION_MANAGER.get_lock(user_id)
 
 
+def apply_synergy_bonuses(state: "GameState") -> None:
+    bonuses = calculate_party_synergies(state.party_order)
+    state.flags["SYNERGY_BONUSES"] = bonuses
+    for cid, character in state.party.items():
+        character.temporary_bonuses = dict(bonuses.get(cid, {}))
+
+
 EQUIP_BONUS_MAP = {
     "atk_bonus": "atk",
     "def_bonus": "defense",
@@ -2023,12 +2168,25 @@ def get_equipment_stat_bonuses(character: CharacterState) -> Dict[str, int]:
             bonus = effects.get(effect_key, 0)
             if bonus:
                 bonuses[attr] = bonuses.get(attr, 0) + bonus
+        upgrade = character.equipment_upgrades.get(slot)
+        if upgrade:
+            applied = upgrade.apply_bonus()
+            for effect_key, attr in EQUIP_BONUS_MAP.items():
+                bonus = applied.get(effect_key, 0)
+                if bonus:
+                    bonuses[attr] = bonuses.get(attr, 0) + bonus
     return bonuses
 
 
 def get_effective_stat(character: CharacterState, attr: str) -> int:
     bonuses = get_equipment_stat_bonuses(character)
-    return getattr(character, attr, 0) + bonuses.get(attr, 0)
+    temp_bonus = character.temporary_bonuses.get(attr, 0)
+    affinity_bonus = 0
+    if attr == "atk" and character.weapon_id:
+        affinity = character.weapon_affinity.get(character.weapon_id)
+        if affinity:
+            affinity_bonus += affinity.atk_bonus
+    return getattr(character, attr, 0) + bonuses.get(attr, 0) + temp_bonus + affinity_bonus
 
 
 def get_effective_max_hp(character: CharacterState) -> int:
@@ -6590,6 +6748,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         async with get_user_lock(user_id):
             state = get_game_state(user_id)
+            apply_synergy_bonuses(state)
         lines = ["=== STATUS PARTY ==="]
         for cid in state.party_order:
             c = state.party.get(cid)
@@ -6608,6 +6767,155 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "Terjadi kesalahan tak terduga. Silakan coba lagi. Jika masalah berlanjut, hubungi admin."
             )
+
+
+@PERFORMANCE_MONITOR.monitored("forge")
+async def forge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    try:
+        async with get_user_lock(user_id):
+            state = get_game_state(user_id)
+            apply_synergy_bonuses(state)
+            args = context.args or []
+            if not args:
+                lines = ["=== Forge & Upgrade ==="]
+                for item_id, qty in state.inventory.items():
+                    if item_id not in WEAPON_UPGRADE_RULES:
+                        continue
+                    upgrade = state.equipment_upgrades.get(item_id, WeaponUpgrade())
+                    lines.append(
+                        f"{item_id} x{qty} | Lv {upgrade.level} | Rate {int(upgrade.success_rate*100)}%"
+                    )
+                if len(lines) == 1:
+                    lines.append("Tidak ada senjata yang bisa di-upgrade.")
+                else:
+                    lines.append("Gunakan /forge <ITEM_ID> untuk mencoba upgrade.")
+                await update.message.reply_text("\n".join(lines))
+                return
+
+            item_id = args[0].upper()
+            success, message = perform_weapon_upgrade(state, item_id, state.inventory)
+            EVENT_BUS.publish(GameEvent(EventType.ITEM_UPGRADED, {"user_id": user_id, "item": item_id}))
+            await update.message.reply_text(message)
+            state.sync_models_from_fields()
+            save_game_state(user_id, state)
+    except Exception:
+        logger.exception("Error di /forge untuk user %s", user_id)
+        if update.message:
+            await update.message.reply_text("Terjadi kesalahan pada forge.")
+
+
+@PERFORMANCE_MONITOR.monitored("craft")
+async def craft_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    try:
+        async with get_user_lock(user_id):
+            state = get_game_state(user_id)
+            args = context.args or []
+            if not args:
+                lines = ["=== Crafting ==="]
+                for rid, recipe in CRAFTING_RECIPES.items():
+                    mats = ", ".join([f"{mid} x{qty}" for mid, qty in recipe["materials"].items()])
+                    res = ", ".join([f"{mid} x{qty}" for mid, qty in recipe["result"].items()])
+                    lines.append(f"{rid}: {mats} -> {res} (Lv {recipe['required_level']})")
+                lines.append("Gunakan /craft <RESEP_ID> untuk meracik.")
+                await update.message.reply_text("\n".join(lines))
+                return
+            recipe_id = args[0].upper()
+            result_text = craft_item(state, recipe_id)
+            if "Berhasil" in result_text:
+                EVENT_BUS.publish(GameEvent(EventType.ITEM_CRAFTED, {"user_id": user_id, "recipe": recipe_id}))
+                save_game_state(user_id, state)
+            await update.message.reply_text(result_text)
+    except Exception:
+        logger.exception("Error di /craft untuk user %s", user_id)
+        if update.message:
+            await update.message.reply_text("Terjadi kesalahan saat crafting.")
+
+
+@PERFORMANCE_MONITOR.monitored("daily")
+async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    try:
+        challenge = DAILY_CHALLENGE_MANAGER.ensure_today()
+        args = context.args or []
+        if args and args[0].isdigit():
+            score = int(args[0])
+            DAILY_CHALLENGE_MANAGER.record_score(user_id, score)
+            EVENT_BUS.publish(
+                GameEvent(EventType.CHALLENGE_COMPLETED, {"user_id": user_id, "score": score})
+            )
+        top_scores = LEADERBOARD_MANAGER.top(challenge.id)
+        my_score = LEADERBOARD_MANAGER.get_score(user_id, challenge.id)
+        lines = [
+            "=== Daily Challenge ===",
+            f"ID: {challenge.id}",
+            f"Tipe: {challenge.type.name}",
+            f"Target: {challenge.params.get('target')}",
+            f"Skor kamu: {my_score}",
+            "Top 5:",
+        ]
+        for uid, score in top_scores[:5]:
+            lines.append(f"{uid}: {score}")
+        lines.append("Kirim /daily <skor> untuk mengirim progres hari ini.")
+        await update.message.reply_text("\n".join(lines))
+    except Exception:
+        logger.exception("Error di /daily untuk user %s", user_id)
+        if update.message:
+            await update.message.reply_text("Daily challenge tidak bisa dimuat.")
+
+
+@PERFORMANCE_MONITOR.monitored("events")
+async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    try:
+        async with get_user_lock(user_id):
+            state = get_game_state(user_id)
+            logs = EVENT_MANAGER.tick(state)
+            if context.args and context.args[0].lower() == "start":
+                event = EVENT_MANAGER.activate_random_event()
+                logs.append(f"Event {event.id} dimulai!")
+            active = EVENT_MANAGER.get_active_modifiers()
+        lines = ["=== World Events ==="]
+        if logs:
+            lines.extend(logs)
+        if not active:
+            lines.append("Tidak ada event aktif.")
+        else:
+            for key, value in active.items():
+                lines.append(f"{key}: x{value}")
+        await update.message.reply_text("\n".join(lines))
+    except Exception:
+        logger.exception("Error di /events untuk user %s", user_id)
+        if update.message:
+            await update.message.reply_text("Gagal memuat event dunia.")
+
+
+async def metrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("Perintah khusus admin.")
+        return
+    summary = PERFORMANCE_MONITOR.summary()
+    lines = ["=== Metrics ===", f"Total: {summary.get('count', 0)}", f"Avg: {summary.get('avg_duration', 0)}"]
+    endpoints = summary.get("endpoints", {})
+    if endpoints:
+        lines.append("Endpoint Terlambat:")
+        for name, data in endpoints.items():
+            lines.append(f"- {name}: {data.get('avg', 0)}s ({data.get('count', 0)}x)")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    stats = STATISTICS_PLUGIN.stats.get(str(user_id), {})
+    lines = ["=== Statistik ==="]
+    if not stats:
+        lines.append("Belum ada aktivitas tercatat.")
+    else:
+        for key, value in stats.items():
+            lines.append(f"{key}: {value}")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def map_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7398,6 +7706,10 @@ def main():
         )
         return
 
+    loop = asyncio.get_event_loop()
+    loop.create_task(TASK_QUEUE.start())
+    loop.create_task(SCHEDULER.run_forever())
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CommandHandler("map", map_cmd))
@@ -7408,6 +7720,12 @@ def main():
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("force_save", force_save_cmd))
     application.add_handler(CommandHandler("show_state", show_state_cmd))
+    application.add_handler(CommandHandler("forge", forge_cmd))
+    application.add_handler(CommandHandler("craft", craft_cmd))
+    application.add_handler(CommandHandler("daily", daily_cmd))
+    application.add_handler(CommandHandler("events", events_cmd))
+    application.add_handler(CommandHandler("metrics", metrics_cmd))
+    application.add_handler(CommandHandler("stats", stats_cmd))
 
     text_filter = filters.TEXT & (~filters.COMMAND)
     application.add_handler(MessageHandler(text_filter, handle_text_message))
