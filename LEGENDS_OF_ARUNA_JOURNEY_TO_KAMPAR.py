@@ -40,11 +40,30 @@ from telegram.ext import (
     filters,
 )
 
+from auto_hunt import AutoHuntSession
+from config import (
+    AUTO_HUNT_RATE_LIMIT,
+    CONFIG,
+    LOAD_RATE_LIMIT,
+    MAP_RATE_LIMIT,
+    SAVE_RATE_LIMIT,
+    TOKEN_ENV_KEY,
+)
+from domain_models import BattleSnapshot, Inventory, Party, PlayerProfile, QuestLog
+from rate_limiters import RateLimiter
+from safe_storage import safe_load_json, safe_save_json
+from session_manager import SessionManager
+from telegram_utils import safe_edit_message, safe_reply, safe_send_message
+
 # ==========================
 # KONFIGURASI
 # ==========================
 
-TOKEN_BOT = "8565685476:AAEX1AaCELoIJkhisYSN3jJ8zapKKRL6xZc"  # <--- Ganti dengan token bot dari BotFather
+TOKEN_BOT = os.getenv(TOKEN_ENV_KEY)
+if not TOKEN_BOT:
+    raise RuntimeError(
+        "BOT token tidak ditemukan. Pastikan variabel lingkungan BOT_TOKEN terisi."
+    )
 ADMIN_USER_IDS = [123456789]  # <--- Ganti dengan daftar ID Telegram admin/developer
 
 LOG_LEVEL = logging.INFO
@@ -956,6 +975,8 @@ def reset_auto_hunt_state(state: "GameState") -> None:
     state.auto_hunt = False
     state.auto_hunt_area = None
     state.auto_hunt_stats = {}
+    if state.auto_hunt_session:
+        state.auto_hunt_session.active = False
 
 
 def get_city_guild_quests(location: str) -> Dict[str, Dict[str, Any]]:
@@ -1598,9 +1619,78 @@ class GameState:
     auto_hunt_stats: Dict[str, Any] = field(default_factory=dict)
     quests_active: Dict[str, QuestState] = field(default_factory=dict)
     quests_completed: List[QuestState] = field(default_factory=list)
+    battle_snapshot: BattleSnapshot = field(default_factory=BattleSnapshot)
+    profile: PlayerProfile = field(init=False)
+    inventory_model: Inventory = field(init=False)
+    quest_log: QuestLog = field(init=False)
+    party_model: Party = field(init=False)
+    auto_hunt_session: AutoHuntSession = field(default_factory=AutoHuntSession)
 
     def __post_init__(self):
         self.ensure_flag_defaults()
+        self.profile = PlayerProfile(
+            user_id=self.user_id,
+            name=self.player_name,
+            location=self.location,
+            main_progress=self.main_progress,
+            scene_id=self.scene_id,
+            gold=self.gold,
+        )
+        self.inventory_model = Inventory(items=dict(self.inventory))
+        self.quest_log = QuestLog(
+            active={qid: qstate.to_dict() for qid, qstate in self.quests_active.items()},
+            completed=[entry.to_dict() for entry in self.quests_completed],
+        )
+        self.party_model = Party(members=self.party, order=self.party_order)
+        self.battle_snapshot = BattleSnapshot(
+            in_battle=self.in_battle,
+            enemies=list(self.battle_enemies),
+            turn=self.battle_turn,
+        )
+
+    def sync_models_from_fields(self) -> None:
+        self.profile.name = self.player_name
+        self.profile.location = self.location
+        self.profile.main_progress = self.main_progress
+        self.profile.scene_id = self.scene_id
+        self.profile.gold = self.gold
+        self.inventory_model.items = dict(self.inventory)
+        self.quest_log.active = {
+            qid: qstate.to_dict() if hasattr(qstate, "to_dict") else dict(qstate)
+            for qid, qstate in self.quests_active.items()
+        }
+        self.quest_log.completed = [
+            quest.to_dict() if hasattr(quest, "to_dict") else dict(quest)
+            for quest in self.quests_completed
+        ]
+        self.party_model.members = self.party
+        self.party_model.order = self.party_order
+        self.battle_snapshot.in_battle = self.in_battle
+        self.battle_snapshot.enemies = list(self.battle_enemies)
+        self.battle_snapshot.turn = self.battle_turn
+
+    def sync_fields_from_models(self) -> None:
+        self.player_name = self.profile.name
+        self.location = self.profile.location
+        self.main_progress = self.profile.main_progress
+        self.scene_id = self.profile.scene_id
+        self.gold = self.profile.gold
+        self.inventory = dict(self.inventory_model.items)
+        self.quests_active = {
+            qid: QuestState.from_dict(data)
+            if isinstance(data, dict)
+            else data
+            for qid, data in self.quest_log.active.items()
+        }
+        self.quests_completed = [
+            QuestState.from_dict(entry) if isinstance(entry, dict) else entry
+            for entry in self.quest_log.completed
+        ]
+        self.party = self.party_model.members
+        self.party_order = list(self.party_model.order)
+        self.in_battle = self.battle_snapshot.in_battle
+        self.battle_enemies = list(self.battle_snapshot.enemies)
+        self.battle_turn = self.battle_snapshot.turn
 
     def ensure_flag_defaults(self):
         default_flags = {
@@ -1617,6 +1707,7 @@ class GameState:
             self.flags.setdefault(key, value)
 
     def to_dict(self) -> Dict[str, Any]:
+        self.sync_models_from_fields()
         safe_flags = {
             k: v
             for k, v in self.flags.items()
@@ -1697,6 +1788,7 @@ class GameState:
             hero = state.party.get("ARUNA")
             if hero:
                 state.player_name = hero.name
+        state.sync_models_from_fields()
         return state
 
     def ensure_aruna(self):
@@ -1791,11 +1883,25 @@ class GameState:
             self.flags["HAS_REZA"] = True
 
 
-# Storage in-memory
-USER_STATES: Dict[int, "GameState"] = {}
-USER_LOCKS: Dict[int, asyncio.Lock] = {}
-
+# Storage in-memory dengan TTL + LRU
 SAVE_DIR = "saves"  # Untuk VPS, pastikan folder ini ada & bisa ditulis (chmod/chown sesuai user bot)
+
+
+def _on_session_evict(user_id: int, state: "GameState") -> None:
+    if state.auto_hunt_session and state.auto_hunt_session.active:
+        try:
+            # best-effort cancellation; cannot await here
+            if state.auto_hunt_session.task:
+                state.auto_hunt_session.task.cancel()
+        except Exception:
+            logger.exception("Gagal membatalkan auto-hunt saat evict user %s", user_id)
+
+
+SESSION_MANAGER = SessionManager(on_evict=_on_session_evict)
+SAVE_RATE_LIMITER = RateLimiter(*SAVE_RATE_LIMIT)
+LOAD_RATE_LIMITER = RateLimiter(*LOAD_RATE_LIMIT)
+AUTO_HUNT_RATE_LIMITER = RateLimiter(*AUTO_HUNT_RATE_LIMIT)
+MAP_RATE_LIMITER = RateLimiter(*MAP_RATE_LIMIT)
 
 
 def get_save_path(user_id: int) -> str:
@@ -1807,44 +1913,18 @@ def serialize_game_state(state: "GameState") -> Dict[str, Any]:
 
 
 def save_game_state(user_id: int, state: "GameState") -> bool:
-    try:
-        os.makedirs(SAVE_DIR, exist_ok=True)
-    except Exception:
-        logger.exception("Gagal membuat folder save saat menyimpan user %s", user_id)
-        return False
-
     path = get_save_path(user_id)
-    tmp_path = f"{path}.tmp"
-    # Menulis ke file .tmp terlebih dahulu menjaga atomisitas sehingga save tidak korup
-    # walaupun proses mati mendadak atau disk penuh.
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(serialize_game_state(state), f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, path)
-        return True
-    except Exception as exc:
-        logger.exception("Gagal menyimpan progress user %s: %s", user_id, exc)
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            logger.exception(
-                "Gagal menghapus file temporary save untuk user %s", user_id
-            )
-        return False
+    payload = serialize_game_state(state)
+    success = safe_save_json(path, payload)
+    if not success:
+        logger.error("Gagal menyimpan progress user %s secara aman", user_id)
+    return success
 
 
 def load_game_state(user_id: int) -> Optional["GameState"]:
     path = get_save_path(user_id)
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return None
-    except Exception as exc:
-        logger.exception("Gagal memuat progress user %s: %s", user_id, exc)
+    data = safe_load_json(path)
+    if not data:
         return None
     try:
         return GameState.from_dict(user_id=user_id, data=data)
@@ -1907,20 +1987,16 @@ def append_optional_text(base: Optional[str], addition: Optional[str]) -> str:
 
 
 def get_game_state(user_id: int) -> "GameState":
-    state = USER_STATES.get(user_id)
-    if not state:
-        state = GameState(user_id=user_id)
+    def _factory(uid: int) -> GameState:
+        state = GameState(user_id=uid)
         state.ensure_aruna()
-        USER_STATES[user_id] = state
-    return state
+        return state
+
+    return SESSION_MANAGER.get_state(user_id, _factory)
 
 
 def get_user_lock(user_id: int) -> asyncio.Lock:
-    lock = USER_LOCKS.get(user_id)
-    if not lock:
-        lock = asyncio.Lock()
-        USER_LOCKS[user_id] = lock
-    return lock
+    return SESSION_MANAGER.get_lock(user_id)
 
 
 EQUIP_BONUS_MAP = {
@@ -5241,6 +5317,18 @@ async def handle_auto_hunt_toggle(
     enable: bool,
 ):
     query = update.callback_query
+    if not AUTO_HUNT_RATE_LIMITER.is_allowed(state.user_id):
+        if query:
+            await query.answer(
+                "Tunggu sebentar sebelum mengganti status auto hunting.", show_alert=True
+            )
+        else:
+            await safe_reply(
+                update,
+                context,
+                "Tunggu sebentar sebelum mengganti status auto hunting.",
+            )
+        return
     if enable:
         if state.auto_hunt:
             if query:
@@ -5300,11 +5388,15 @@ async def handle_auto_hunt_toggle(
             await query.answer(
                 f"Auto hunting dimulai di {area_name}.", show_alert=False
             )
+        session = state.auto_hunt_session or AutoHuntSession()
+        state.auto_hunt_session = session
+        session.active = True
         runner = run_auto_hunt_loop(update, context, state)
         if context.application:
-            context.application.create_task(runner)
+            task = context.application.create_task(runner)
         else:
-            asyncio.create_task(runner)
+            task = asyncio.create_task(runner)
+        session.attach_task(task, area_id)
     else:
         if not state.auto_hunt:
             if query:
@@ -5318,6 +5410,8 @@ async def handle_auto_hunt_toggle(
             "loop_active"
         )
         state.auto_hunt = False
+        if state.auto_hunt_session:
+            state.auto_hunt_session.active = False
         if query:
             await query.answer("Sedang menghentikan auto hunting...", show_alert=False)
         if finalize_now:
@@ -5326,6 +5420,13 @@ async def handle_auto_hunt_toggle(
                 context.application.create_task(runner)
             else:
                 asyncio.create_task(runner)
+        elif state.auto_hunt_session and state.auto_hunt_session.task:
+            if context.application:
+                context.application.create_task(
+                    state.auto_hunt_session.stop(reason_text)
+                )
+            else:
+                asyncio.create_task(state.auto_hunt_session.stop(reason_text))
 
 
 def get_low_hp_allies(state: GameState, threshold: float) -> List[CharacterState]:
@@ -5620,8 +5721,12 @@ async def send_auto_hunt_state(
     message_id = stats.get("auto_message_id")
     try:
         if chat_id and message_id:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=message_id, text=text, reply_markup=keyboard
+            await safe_edit_message(
+                context,
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=keyboard,
             )
         elif update.callback_query and update.callback_query.message:
             await safe_edit_text(
@@ -5634,17 +5739,17 @@ async def send_auto_hunt_state(
                 update.callback_query.message.message_id
             )
         elif chat_id:
-            message = await context.bot.send_message(
-                chat_id=chat_id, text=text, reply_markup=keyboard
+            message = await safe_send_message(
+                context, chat_id=chat_id, text=text, reply_markup=keyboard
             )
-            state.auto_hunt_stats["auto_chat_id"] = message.chat_id
-            state.auto_hunt_stats["auto_message_id"] = message.message_id
+            if message:
+                state.auto_hunt_stats["auto_chat_id"] = message.chat_id
+                state.auto_hunt_stats["auto_message_id"] = message.message_id
         elif update.effective_message:
-            message = await update.effective_message.reply_text(
-                text=text, reply_markup=keyboard
-            )
-            state.auto_hunt_stats["auto_chat_id"] = message.chat_id
-            state.auto_hunt_stats["auto_message_id"] = message.message_id
+            message = await safe_reply(update, context, text=text, reply_markup=keyboard)
+            if message:
+                state.auto_hunt_stats["auto_chat_id"] = message.chat_id
+                state.auto_hunt_stats["auto_message_id"] = message.message_id
     except BadRequest as exc:
         if "message is not modified" in str(exc).lower():
             return
@@ -5749,6 +5854,7 @@ async def run_auto_hunt_loop(
     state: GameState,
 ):
     lock = get_user_lock(state.user_id)
+    session = state.auto_hunt_session
     log_lines: List[str] = []
     stop_reason = ""
     try:
@@ -5757,11 +5863,16 @@ async def run_auto_hunt_loop(
             if not stats:
                 return
             stats["loop_active"] = True
+            if session:
+                session.active = True
         while True:
             async with lock:
                 stats = state.auto_hunt_stats
                 if not stats:
                     stop_reason = stop_reason or "Auto hunting dihentikan."
+                    break
+                if session and not session.active:
+                    stop_reason = "Auto hunting dihentikan (session reset)."
                     break
                 if not (state.auto_hunt and state.auto_hunt_area):
                     stop_reason = stats.get("stop_reason") or "Auto hunting dihentikan."
@@ -5795,7 +5906,7 @@ async def run_auto_hunt_loop(
                     intro_lines.append("Aura kuat menyelimuti udara. Monster langka!")
                 log_lines = intro_lines[-5:]
             await send_auto_hunt_state(update, context, state, log_lines)
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(CONFIG.auto_hunt_delay)
             battle_over = False
             enemy_defeated = False
             while not battle_over:
@@ -5811,6 +5922,12 @@ async def run_auto_hunt_loop(
                             state.in_battle = False
                             battle_over = True
                             action_logs: List[str] = []
+                            break
+                        if session and not session.active:
+                            stop_reason = "Auto hunting dihentikan (session reset)."
+                            state.in_battle = False
+                            battle_over = True
+                            action_logs = []
                             break
                         if not state.battle_enemies:
                             action_logs = []
@@ -5837,7 +5954,7 @@ async def run_auto_hunt_loop(
                         log_lines.extend(action_logs)
                         log_lines = log_lines[-5:]
                         await send_auto_hunt_state(update, context, state, log_lines)
-                        await asyncio.sleep(0.6)
+                        await asyncio.sleep(CONFIG.auto_hunt_delay)
                     if battle_over:
                         break
                 if battle_over:
@@ -5854,21 +5971,27 @@ async def run_auto_hunt_loop(
                         battle_over = True
                         enemy_logs: List[str] = []
                     else:
-                        enemy = state.battle_enemies[0]
-                        enemy_logs, party_defeated = perform_auto_enemy_attack(
-                            state, enemy
-                        )
-                        if party_defeated:
-                            state.auto_hunt = False
+                        if session and not session.active:
+                            stop_reason = "Auto hunting dihentikan (session reset)."
                             state.in_battle = False
-                            stop_reason = "Seluruh party tumbang saat auto hunting."
-                            state.flags["LAST_BATTLE_RESULT"] = "LOSE"
                             battle_over = True
+                            enemy_logs = []
+                        else:
+                            enemy = state.battle_enemies[0]
+                            enemy_logs, party_defeated = perform_auto_enemy_attack(
+                                state, enemy
+                            )
+                            if party_defeated:
+                                state.auto_hunt = False
+                                state.in_battle = False
+                                stop_reason = "Seluruh party tumbang saat auto hunting."
+                                state.flags["LAST_BATTLE_RESULT"] = "LOSE"
+                                battle_over = True
                 if enemy_logs:
                     log_lines.extend(enemy_logs)
                     log_lines = log_lines[-5:]
                     await send_auto_hunt_state(update, context, state, log_lines)
-                    await asyncio.sleep(0.6)
+                    await asyncio.sleep(CONFIG.auto_hunt_delay)
                 if battle_over:
                     break
                 if enemy.get("hp", 0) <= 0:
@@ -5933,7 +6056,7 @@ async def run_auto_hunt_loop(
                 log_lines.extend(summary_lines)
                 log_lines = log_lines[-5:]
                 await send_auto_hunt_state(update, context, state, log_lines)
-                await asyncio.sleep(0.6)
+                await asyncio.sleep(CONFIG.auto_hunt_delay)
                 continue
             break
     except Exception:
@@ -5946,6 +6069,8 @@ async def run_auto_hunt_loop(
                 stats["loop_active"] = False
                 if not stop_reason:
                     stop_reason = stats.get("stop_reason") or "Auto hunting selesai."
+            if session:
+                session.active = False
     await stop_auto_hunt(
         update, context, state, reason=stop_reason or "Auto hunting selesai."
     )
@@ -6488,13 +6613,23 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def map_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     try:
+        if not MAP_RATE_LIMITER.is_allowed(user_id):
+            if update.message:
+                await safe_reply(
+                    update,
+                    context,
+                    "Permintaan /map terlalu sering. Coba lagi sebentar lagi.",
+                )
+            return
         async with get_user_lock(user_id):
             state = get_game_state(user_id)
         await send_world_map(update, context, state)
     except Exception:
         logger.exception("Error di handler /map untuk user %s", user_id)
         if update.message:
-            await update.message.reply_text(
+            await safe_reply(
+                update,
+                context,
                 "Terjadi kesalahan tak terduga. Silakan coba lagi. Jika masalah berlanjut, hubungi admin."
             )
 
@@ -6502,22 +6637,34 @@ async def map_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def save_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     try:
+        if not SAVE_RATE_LIMITER.is_allowed(user_id):
+            if update.message:
+                await safe_reply(
+                    update,
+                    context,
+                    "Permintaan /save terlalu sering. Coba beberapa detik lagi.",
+                )
+            return
         async with get_user_lock(user_id):
             state = get_game_state(user_id)
             success = save_game_state(user_id, state)
         if update.message:
             if success:
                 logger.info("User %s melakukan manual save (berhasil)", user_id)
-                await update.message.reply_text("Progress permainanmu telah disimpan.")
+                await safe_reply(update, context, "Progress permainanmu telah disimpan.")
             else:
                 logger.warning("User %s gagal manual save", user_id)
-                await update.message.reply_text(
+                await safe_reply(
+                    update,
+                    context,
                     "Gagal menyimpan progress. Silakan coba lagi atau cek izin folder saves."
                 )
     except Exception:
         logger.exception("Error di handler /save untuk user %s", user_id)
         if update.message:
-            await update.message.reply_text(
+            await safe_reply(
+                update,
+                context,
                 "Terjadi kesalahan tak terduga. Silakan coba lagi. Jika masalah berlanjut, hubungi admin."
             )
 
@@ -6525,17 +6672,25 @@ async def save_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def load_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     try:
+        if not LOAD_RATE_LIMITER.is_allowed(user_id):
+            if update.message:
+                await safe_reply(
+                    update,
+                    context,
+                    "Permintaan /load terlalu sering. Coba beberapa detik lagi.",
+                )
+            return
         async with get_user_lock(user_id):
             save_exists = os.path.exists(get_save_path(user_id))
             loaded = load_game_state(user_id)
             if not loaded:
                 if update.message:
                     if save_exists:
-                        await update.message.reply_text(
+                        await safe_reply(
                             "Gagal memuat save. Coba lagi nanti atau periksa file di folder saves."
                         )
                     else:
-                        await update.message.reply_text(
+                        await safe_reply(
                             "Tidak ada data save yang ditemukan untuk akunmu."
                         )
                 logger.warning(
@@ -6543,13 +6698,13 @@ async def load_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             loaded.ensure_aruna()
-            USER_STATES[user_id] = loaded
+            SESSION_MANAGER.set_state(user_id, loaded)
         if update.message:
             loc_name = LOCATIONS.get(loaded.location, {}).get("name", loaded.location)
             aruna = loaded.party.get("ARUNA")
             hero_name = loaded.player_name or (aruna.name if aruna else "Ksatria")
             aruna_level = aruna.level if aruna else "-"
-            await update.message.reply_text(
+            await safe_reply(
                 (
                     "Progress berhasil dimuat!\n"
                     f"Lokasi: {loc_name}\n"
@@ -6561,7 +6716,7 @@ async def load_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Error di handler /load untuk user %s", user_id)
         if update.message:
-            await update.message.reply_text(
+            await safe_reply(
                 "Terjadi kesalahan tak terduga. Silakan coba lagi. Jika masalah berlanjut, hubungi admin."
             )
 
