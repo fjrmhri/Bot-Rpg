@@ -82,6 +82,38 @@ from safe_storage import safe_load_json, safe_save_json
 from session_manager import SessionManager
 from telegram_utils import safe_edit_message, safe_reply, safe_send_message
 
+# Import sistem baru
+from combat_engine import (
+    ActionType,
+    CombatEngine,
+    CombatEntity,
+    CombatStats,
+    create_skill_database,
+    ai_choose_action,
+)
+from crafting_system import (
+    CraftingSystem,
+    ItemRarity,
+    generate_material_drops,
+    roll_material_drops,
+)
+from jobs_system import (
+    JobSystem,
+    JobProgress,
+    EnergySystem,
+    WorkSession,
+    format_time_remaining,
+)
+from combat_ui import (
+    create_hp_bar,
+    create_mp_bar,
+    format_battle_state,
+    format_crafting_menu,
+    format_job_menu,
+    format_victory_message,
+    format_work_progress,
+)
+
 # ==========================
 # KONFIGURASI
 # ==========================
@@ -139,6 +171,11 @@ PERFORMANCE_MONITOR = PerformanceMonitor()
 TASK_QUEUE = TaskQueue()
 SCHEDULER = ScheduledTaskManager(TASK_QUEUE, DAILY_CHALLENGE_MANAGER)
 HYBRID_STORAGE = HybridStorage()
+
+# Sistem baru: Crafting & Jobs
+CRAFTING_SYSTEM = CraftingSystem()
+JOB_SYSTEM = JobSystem()
+SKILL_DATABASE = create_skill_database()
 
 
 async def safe_edit_text(
@@ -421,6 +458,46 @@ ITEMS = {
             "mp_bonus": 12,
             "passives": {"element_boost": {"CAHAYA": 0.05}},
         },
+    },
+    "STEEL_SWORD": {
+        "id": "STEEL_SWORD",
+        "name": "Pedang Baja",
+        "description": "Pedang baja berkualitas tinggi",
+        "type": "weapon",
+        "buy_price": 400,
+        "sell_price": 200,
+        "allowed_users": ["ARUNA"],
+        "effects": {"atk_bonus": 12},
+    },
+    "GUARDIAN_PLATE": {
+        "id": "GUARDIAN_PLATE",
+        "name": "Armor Pelindung",
+        "description": "Armor berat untuk pertahanan maksimal",
+        "type": "armor",
+        "buy_price": 500,
+        "sell_price": 250,
+        "allowed_users": ["ARUNA"],
+        "effects": {"def_bonus": 10, "hp_bonus": 30},
+    },
+    "MITHRIL_BLADE": {
+        "id": "MITHRIL_BLADE",
+        "name": "Pedang Mithril",
+        "description": "Pedang legendaris dari mithril",
+        "type": "weapon",
+        "buy_price": 1200,
+        "sell_price": 600,
+        "allowed_users": ["ARUNA"],
+        "effects": {"atk_bonus": 18, "spd_bonus": 3},
+    },
+    "VOID_ARMOR": {
+        "id": "VOID_ARMOR",
+        "name": "Armor Kehampaan",
+        "description": "Armor yang diperkuat energi void",
+        "type": "armor",
+        "buy_price": 1500,
+        "sell_price": 750,
+        "allowed_users": ["ARUNA"],
+        "effects": {"def_bonus": 15, "hp_bonus": 50, "mag_bonus": 5},
     },
     "HARSAN_LEGACY_BLADE": {
         "id": "HARSAN_LEGACY_BLADE",
@@ -1705,8 +1782,21 @@ class GameState:
     battle_snapshot: BattleSnapshot = field(default_factory=BattleSnapshot)
     daily_challenge_id: Optional[str] = None
     daily_score: int = 0
-    version: int = 2
+    version: int = 3  # Upgrade version untuk sistem baru
     status_manager: StatusEffectManager = field(default_factory=StatusEffectManager)
+    
+    # Sistem baru: Crafting & Materials
+    materials: Dict[str, int] = field(default_factory=dict)  # material_id -> quantity
+    
+    # Sistem baru: Jobs & Energy
+    current_job_id: Optional[str] = None  # ID pekerjaan saat ini
+    job_progress: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # job_id -> progress data
+    energy_system: Optional[EnergySystem] = None  # Sistem energy untuk kerja
+    active_work_session: Optional[WorkSession] = None  # Work session yang sedang berlangsung
+    
+    # Combat engine baru
+    combat_engine: Optional[CombatEngine] = None  # Engine pertempuran yang ditingkatkan
+    battle_message_id: Optional[int] = None  # ID pesan battle untuk editing
     profile: PlayerProfile = field(init=False)
     inventory_model: Inventory = field(init=False)
     quest_log: QuestLog = field(init=False)
@@ -1734,6 +1824,14 @@ class GameState:
             enemies=list(self.battle_enemies),
             turn=self.battle_turn,
         )
+        
+        # Inisialisasi sistem baru jika belum ada
+        if self.energy_system is None:
+            self.energy_system = EnergySystem()
+        
+        # Update energy saat load state
+        if self.energy_system:
+            self.energy_system.update_energy()
 
     def sync_models_from_fields(self) -> None:
         self.profile.name = self.player_name
@@ -1849,6 +1947,11 @@ class GameState:
             "daily_challenge_id": self.daily_challenge_id,
             "daily_score": self.daily_score,
             "version": self.version,
+            "materials": dict(self.materials),
+            "current_job_id": self.current_job_id,
+            "job_progress": dict(self.job_progress),
+            "energy_system": self.energy_system.to_dict() if self.energy_system else None,
+            "active_work_session": self.active_work_session.to_dict() if self.active_work_session else None,
         }
 
     @classmethod
@@ -1914,6 +2017,26 @@ class GameState:
         state.daily_challenge_id = data.get("daily_challenge_id")
         state.daily_score = int(data.get("daily_score", 0))
         state.version = int(data.get("version", 1))
+        
+        # Load new systems
+        state.materials = data.get("materials", {})
+        state.current_job_id = data.get("current_job_id")
+        state.job_progress = data.get("job_progress", {})
+        
+        # Load energy system
+        energy_data = data.get("energy_system")
+        if energy_data:
+            state.energy_system = EnergySystem.from_dict(energy_data)
+        else:
+            state.energy_system = EnergySystem()
+        
+        # Load work session
+        work_data = data.get("active_work_session")
+        if work_data:
+            state.active_work_session = WorkSession.from_dict(work_data)
+        else:
+            state.active_work_session = None
+        
         if not state.player_name:
             hero = state.party.get("ARUNA")
             if hero:
@@ -2847,15 +2970,41 @@ async def resolve_battle_outcome(
         total_xp = sum(enemy.get("xp", 0) for enemy in state.battle_enemies)
         total_gold = sum(enemy.get("gold", 0) for enemy in state.battle_enemies)
         state.in_battle = False
+        
+        # Material drops dari musuh
+        material_drops = {}
+        for enemy in state.battle_enemies:
+            enemy_level = enemy.get("level", 1)
+            enemy_rarity = "COMMON"  # Bisa diperluas dengan sistem rarity
+            drops_config = generate_material_drops(enemy_level, enemy_rarity)
+            rolled_materials = roll_material_drops(drops_config)
+            for mat_id, qty in rolled_materials.items():
+                material_drops[mat_id] = material_drops.get(mat_id, 0) + qty
+        
+        # Tambahkan material ke inventory player
+        for mat_id, qty in material_drops.items():
+            state.materials[mat_id] = state.materials.get(mat_id, 0) + qty
+        
         state.battle_enemies = []
         state.flags["LAST_BATTLE_RESULT"] = "WIN"
         reward_logs = handle_after_battle_xp_and_level_up(state, total_xp, total_gold)
         drop_logs, _ = grant_battle_drops(state)
+        
+        # Format drop section dengan item + materials
         drop_section = ["Drop:"]
         if drop_logs:
             drop_section.extend(f"- {entry}" for entry in drop_logs)
-        else:
+        
+        # Tambahkan material drops
+        if material_drops:
+            for mat_id, qty in material_drops.items():
+                mat = CRAFTING_SYSTEM.materials.get(mat_id)
+                mat_name = mat.name if mat else mat_id
+                drop_section.append(f"- [Material] {mat_name} x{qty}")
+        
+        if not drop_logs and not material_drops:
             drop_section.append("- (tidak ada)")
+        
         summary_lines = [
             "==== VICTORY ====",
             "Kamu mengalahkan musuh!",
@@ -5088,8 +5237,16 @@ async def send_city_menu(
     ]
     if loc.get("has_shop"):
         choices.append(("Pergi ke toko", "MENU_SHOP"))
+    
+    # Crafting tersedia di semua kota kecuali Kampar (cursed)
+    if state.location != "KAMPAR":
+        choices.append(("Bengkel Crafting", "MENU_CRAFTING"))
+    
     if loc.get("has_guild"):
         choices.append(("Pergi ke guild (Quest)", "MENU_GUILD"))
+        # Jobs hanya di kota dengan guild
+        choices.append(("Guild Pekerjaan", "MENU_JOBS"))
+    
     if loc.get("has_inn"):
         choices.append(("Ke penginapan (heal)", "MENU_INN"))
     if loc.get("has_clinic"):
@@ -6346,6 +6503,401 @@ async def handle_sell_item(
     await send_shop_sell_menu(update, context, state)
 
 
+# ==========================
+# CRAFTING HANDLERS
+# ==========================
+
+async def send_crafting_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: GameState
+):
+    """Tampilkan menu crafting dengan resep yang tersedia"""
+    query = update.callback_query
+    
+    # Pastikan player di kota
+    if state.location not in CRAFTING_SYSTEM.city_tiers:
+        await safe_edit_text(query, "Crafting hanya tersedia di kota.")
+        return
+    
+    # Update energy sistem
+    if state.energy_system:
+        state.energy_system.update_energy()
+    
+    # Dapatkan resep yang tersedia di kota ini
+    available_recipes = CRAFTING_SYSTEM.get_recipes_for_city(state.location)
+    
+    if not available_recipes:
+        text = "Tidak ada resep crafting yang tersedia di kota ini."
+        keyboard = make_keyboard([("Kembali ke kota", "BACK_CITY_MENU")])
+        await safe_edit_text(query, text=text, reply_markup=keyboard)
+        return
+    
+    lines = ["=== BENGKEL CRAFTING ==="]
+    lines.append(f"Lokasi: {LOCATIONS[state.location]['name']}")
+    lines.append(f"Gold: {state.gold}")
+    lines.append("")
+    lines.append("Resep yang tersedia:")
+    
+    buttons = []
+    
+    for recipe in available_recipes:
+        # Cek apakah bisa craft
+        can_craft, error_msg = CRAFTING_SYSTEM.can_craft(
+            recipe.id, state.materials, state.gold, state.location
+        )
+        
+        # Format material requirements
+        mat_info = []
+        for mat_id, req_qty in recipe.materials.items():
+            player_qty = state.materials.get(mat_id, 0)
+            mat = CRAFTING_SYSTEM.materials.get(mat_id)
+            mat_name = mat.name if mat else mat_id
+            status = "OK" if player_qty >= req_qty else f"KURANG"
+            mat_info.append(f"{mat_name}: {player_qty}/{req_qty} [{status}]")
+        
+        lines.append(f"\n{recipe.name} - {recipe.rarity.value}")
+        lines.append(f"  {recipe.description}")
+        lines.append(f"  Biaya: {recipe.gold_cost} gold")
+        lines.append("  Material:")
+        for info in mat_info:
+            lines.append(f"    - {info}")
+        
+        # Button
+        button_text = f"Craft {recipe.name}" if can_craft else f"[X] {recipe.name}"
+        buttons.append([InlineKeyboardButton(button_text, callback_data=f"CRAFT_ITEM|{recipe.id}")])
+    
+    buttons.append([InlineKeyboardButton("Kembali ke kota", callback_data="BACK_CITY_MENU")])
+    
+    text = "\n".join(lines)
+    markup = InlineKeyboardMarkup(buttons)
+    await safe_edit_text(query, text=text, reply_markup=markup)
+
+
+async def handle_craft_item(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: GameState, recipe_id: str
+):
+    """Handle crafting item"""
+    query = update.callback_query
+    
+    # Cek apakah bisa craft
+    can_craft, error_msg = CRAFTING_SYSTEM.can_craft(
+        recipe_id, state.materials, state.gold, state.location
+    )
+    
+    if not can_craft:
+        await query.answer(error_msg, show_alert=True)
+        return
+    
+    # Craft item
+    success, updated_materials, updated_gold, message = CRAFTING_SYSTEM.craft_item(
+        recipe_id, state.materials, state.gold
+    )
+    
+    if not success:
+        await query.answer(message, show_alert=True)
+        return
+    
+    # Update state
+    state.materials = updated_materials
+    state.gold = updated_gold
+    
+    # Tambahkan item hasil craft ke inventory
+    recipe = CRAFTING_SYSTEM.recipes.get(recipe_id)
+    if recipe:
+        adjust_inventory(state, recipe.result_item_id, recipe.result_quantity)
+        item = ITEMS.get(recipe.result_item_id)
+        item_name = item.get("name") if item else recipe.result_item_id
+        await query.answer(f"{message} Mendapat {item_name} x{recipe.result_quantity}", show_alert=True)
+    
+    # Refresh menu
+    await send_crafting_menu(update, context, state)
+
+
+# ==========================
+# JOBS HANDLERS
+# ==========================
+
+async def send_jobs_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: GameState
+):
+    """Tampilkan menu pekerjaan"""
+    query = update.callback_query
+    
+    # Update energy
+    if state.energy_system:
+        state.energy_system.update_energy()
+    
+    # Cek apakah sedang bekerja
+    if state.active_work_session and not state.active_work_session.check_completion():
+        remaining_seconds = state.active_work_session.get_remaining_seconds()
+        job = JOB_SYSTEM.jobs.get(state.active_work_session.job_id)
+        job_name = job.name if job else state.active_work_session.job_id
+        
+        text = format_work_progress(
+            job_name,
+            remaining_seconds,
+            state.active_work_session.energy_spent
+        )
+        
+        buttons = [
+            [InlineKeyboardButton("Cek Progress", callback_data="JOB_CHECK_WORK")],
+            [InlineKeyboardButton("Kembali ke kota", callback_data="BACK_CITY_MENU")]
+        ]
+        markup = InlineKeyboardMarkup(buttons)
+        await safe_edit_text(query, text=text, reply_markup=markup)
+        return
+    
+    # Jika work session selesai, proses reward
+    if state.active_work_session and state.active_work_session.check_completion():
+        job_progress = state.job_progress.get(state.active_work_session.job_id)
+        
+        # Convert dict to JobProgress if needed
+        if job_progress and isinstance(job_progress, dict):
+            job_progress = JobProgress.from_dict(job_progress)
+        
+        gold, exp, updated_progress, logs = JOB_SYSTEM.complete_work(
+            state.active_work_session, job_progress
+        )
+        
+        state.gold += gold
+        
+        # Update job progress
+        if updated_progress:
+            state.job_progress[state.active_work_session.job_id] = updated_progress.to_dict()
+            
+            # Apply stat bonuses
+            bonuses = JOB_SYSTEM.get_total_stat_bonus(
+                state.active_work_session.job_id,
+                updated_progress.level
+            )
+            
+            # Update stats for Aruna (main character)
+            aruna = state.party.get("ARUNA")
+            if aruna:
+                for stat_name, bonus in bonuses.items():
+                    if stat_name == "atk":
+                        aruna.atk = CHAR_BASE["ARUNA"]["atk"] + bonus
+                    elif stat_name == "defense":
+                        aruna.defense = CHAR_BASE["ARUNA"]["defense"] + bonus
+                    elif stat_name == "mag":
+                        aruna.mag = CHAR_BASE["ARUNA"]["mag"] + bonus
+                    elif stat_name == "spd":
+                        aruna.spd = CHAR_BASE["ARUNA"]["spd"] + bonus
+                    elif stat_name == "max_hp":
+                        aruna.max_hp = CHAR_BASE["ARUNA"]["max_hp"] + int(bonus)
+                        aruna.hp = min(aruna.hp, aruna.max_hp)
+                    elif stat_name == "max_mp":
+                        aruna.max_mp = CHAR_BASE["ARUNA"]["max_mp"] + int(bonus)
+                        aruna.mp = min(aruna.mp, aruna.max_mp)
+            
+            # Jika mencapai level max, keluar otomatis
+            if updated_progress.level >= JOB_SYSTEM.jobs[state.active_work_session.job_id].max_level:
+                state.current_job_id = None
+        
+        # Clear work session
+        state.active_work_session = None
+        
+        # Show results
+        result_text = "\n".join(logs)
+        await query.answer(result_text, show_alert=True)
+    
+    # Tampilkan menu jobs
+    lines = ["=== GUILD PEKERJAAN ==="]
+    energy_current = state.energy_system.current_energy if state.energy_system else 0
+    energy_max = state.energy_system.max_energy if state.energy_system else 100
+    lines.append(f"Energy: {energy_current}/{energy_max}")
+    lines.append("")
+    
+    buttons = []
+    
+    if state.current_job_id:
+        # Player sudah punya job
+        job = JOB_SYSTEM.jobs.get(state.current_job_id)
+        if job:
+            job_prog = state.job_progress.get(state.current_job_id, {})
+            if isinstance(job_prog, dict):
+                job_level = job_prog.get("level", 1)
+                job_exp = job_prog.get("exp", 0)
+            else:
+                job_level = job_prog.level
+                job_exp = job_prog.exp
+            
+            next_level_exp = JOB_SYSTEM.exp_for_next_level(job_level)
+            
+            lines.append(f"Pekerjaan saat ini: {job.name}")
+            lines.append(f"Level: {job_level}/{job.max_level}")
+            lines.append(f"EXP: {job_exp}/{next_level_exp}")
+            lines.append("")
+            lines.append("Pertumbuhan stat:")
+            for stat, growth in job.stat_growth.items():
+                total_bonus = int(growth * job_level)
+                lines.append(f"  +{total_bonus} {stat.upper()}")
+            lines.append("")
+            
+            # Tombol untuk bekerja atau keluar
+            if energy_current >= 1:
+                buttons.append([InlineKeyboardButton("Bekerja (1 energy)", callback_data=f"JOB_WORK|1")])
+                if energy_current >= 5:
+                    buttons.append([InlineKeyboardButton("Bekerja (5 energy)", callback_data=f"JOB_WORK|5")])
+                if energy_current >= 10:
+                    buttons.append([InlineKeyboardButton("Bekerja (10 energy)", callback_data=f"JOB_WORK|10")])
+            
+            buttons.append([InlineKeyboardButton("Keluar dari Pekerjaan", callback_data="JOB_QUIT")])
+    else:
+        # Player belum punya job, tampilkan pilihan
+        lines.append("Pilih pekerjaan yang ingin kamu ambil:")
+        lines.append("")
+        
+        # Get Aruna stats for requirements check
+        aruna = state.party.get("ARUNA")
+        player_stats = {
+            "level": aruna.level if aruna else 1,
+            "atk": aruna.atk if aruna else 0,
+            "defense": aruna.defense if aruna else 0,
+            "mag": aruna.mag if aruna else 0,
+        }
+        
+        for job_id, job in JOB_SYSTEM.jobs.items():
+            can_take, error = JOB_SYSTEM.can_start_job(job_id, player_stats, state.current_job_id)
+            
+            lines.append(f"{job.name}")
+            lines.append(f"  {job.description}")
+            
+            if job.requirements:
+                req_str = ", ".join([f"{k}: {v}" for k, v in job.requirements.items()])
+                lines.append(f"  Persyaratan: {req_str}")
+            
+            growth_str = ", ".join([f"+{v} {k}/level" for k, v in job.stat_growth.items()])
+            lines.append(f"  Pertumbuhan: {growth_str}")
+            lines.append(f"  Reward: {job.base_gold_per_minute} gold/menit")
+            lines.append("")
+            
+            button_text = f"Ambil: {job.name}" if can_take else f"[X] {job.name}"
+            buttons.append([InlineKeyboardButton(button_text, callback_data=f"JOB_TAKE|{job_id}")])
+    
+    buttons.append([InlineKeyboardButton("Kembali ke kota", callback_data="BACK_CITY_MENU")])
+    
+    text = "\n".join(lines)
+    markup = InlineKeyboardMarkup(buttons)
+    await safe_edit_text(query, text=text, reply_markup=markup)
+
+
+async def handle_take_job(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: GameState, job_id: str
+):
+    """Handle pengambilan pekerjaan baru"""
+    query = update.callback_query
+    
+    # Get Aruna stats for requirements check
+    aruna = state.party.get("ARUNA")
+    player_stats = {
+        "level": aruna.level if aruna else 1,
+        "atk": aruna.atk if aruna else 0,
+        "defense": aruna.defense if aruna else 0,
+        "mag": aruna.mag if aruna else 0,
+    }
+    
+    can_start, error_msg = JOB_SYSTEM.can_start_job(job_id, player_stats, state.current_job_id)
+    
+    if not can_start:
+        await query.answer(error_msg, show_alert=True)
+        return
+    
+    # Set job
+    state.current_job_id = job_id
+    
+    # Initialize job progress if not exists
+    if job_id not in state.job_progress:
+        state.job_progress[job_id] = JobProgress(
+            job_id=job_id,
+            level=1,
+            exp=0,
+            total_time_worked=0
+        ).to_dict()
+    
+    job = JOB_SYSTEM.jobs.get(job_id)
+    job_name = job.name if job else job_id
+    await query.answer(f"Kamu sekarang bekerja sebagai {job_name}!", show_alert=True)
+    
+    # Refresh menu
+    await send_jobs_menu(update, context, state)
+
+
+async def handle_quit_job(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: GameState
+):
+    """Handle keluar dari pekerjaan"""
+    query = update.callback_query
+    
+    if not state.current_job_id:
+        await query.answer("Kamu tidak memiliki pekerjaan saat ini.", show_alert=True)
+        return
+    
+    job = JOB_SYSTEM.jobs.get(state.current_job_id)
+    job_name = job.name if job else state.current_job_id
+    
+    state.current_job_id = None
+    
+    await query.answer(f"Kamu telah keluar dari pekerjaan {job_name}.", show_alert=True)
+    
+    # Refresh menu
+    await send_jobs_menu(update, context, state)
+
+
+async def handle_start_work(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: GameState, energy_amount: int
+):
+    """Handle memulai work session"""
+    query = update.callback_query
+    
+    if not state.current_job_id:
+        await query.answer("Kamu harus memiliki pekerjaan terlebih dahulu.", show_alert=True)
+        return
+    
+    # Update energy
+    if state.energy_system:
+        state.energy_system.update_energy()
+    
+    success, work_session, message = JOB_SYSTEM.start_work(
+        state.current_job_id,
+        energy_amount,
+        state.energy_system
+    )
+    
+    if not success:
+        await query.answer(message, show_alert=True)
+        return
+    
+    # Set work session
+    state.active_work_session = work_session
+    
+    await query.answer(f"{message}. Kamu tidak bisa melakukan aktivitas lain.", show_alert=True)
+    
+    # Refresh menu untuk menampilkan progress
+    await send_jobs_menu(update, context, state)
+
+
+async def handle_check_work_progress(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: GameState
+):
+    """Handle pengecekan progress pekerjaan"""
+    query = update.callback_query
+    
+    if not state.active_work_session:
+        await query.answer("Kamu tidak sedang bekerja.", show_alert=True)
+        return
+    
+    # Cek apakah sudah selesai
+    if state.active_work_session.check_completion():
+        await query.answer("Pekerjaan selesai! Kembali ke menu untuk mengambil reward.", show_alert=True)
+    else:
+        remaining_seconds = state.active_work_session.get_remaining_seconds()
+        time_str = format_time_remaining(remaining_seconds)
+        await query.answer(f"Sisa waktu: {time_str}", show_alert=True)
+    
+    # Refresh menu
+    await send_jobs_menu(update, context, state)
+
+
 async def send_equipment_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE, state: GameState
 ):
@@ -7491,6 +8043,57 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         return
                     item_id = parts[1]
                     await handle_sell_item(update, context, state, item_id)
+                    return
+                
+                # Crafting handlers
+                if data == "MENU_CRAFTING":
+                    handled = True
+                    await send_crafting_menu(update, context, state)
+                    return
+                if data.startswith("CRAFT_ITEM|"):
+                    handled = True
+                    parts = parse_callback_parts(data, 2)
+                    if not parts:
+                        await notify_unknown_callback(update)
+                        return
+                    recipe_id = parts[1]
+                    await handle_craft_item(update, context, state, recipe_id)
+                    return
+                
+                # Jobs handlers
+                if data == "MENU_JOBS":
+                    handled = True
+                    await send_jobs_menu(update, context, state)
+                    return
+                if data.startswith("JOB_TAKE|"):
+                    handled = True
+                    parts = parse_callback_parts(data, 2)
+                    if not parts:
+                        await notify_unknown_callback(update)
+                        return
+                    job_id = parts[1]
+                    await handle_take_job(update, context, state, job_id)
+                    return
+                if data == "JOB_QUIT":
+                    handled = True
+                    await handle_quit_job(update, context, state)
+                    return
+                if data.startswith("JOB_WORK|"):
+                    handled = True
+                    parts = parse_callback_parts(data, 2)
+                    if not parts:
+                        await notify_unknown_callback(update)
+                        return
+                    energy_str = parts[1]
+                    try:
+                        energy_amount = int(energy_str)
+                        await handle_start_work(update, context, state, energy_amount)
+                    except ValueError:
+                        await safe_edit_text(query, "Energy harus berupa angka.")
+                    return
+                if data == "JOB_CHECK_WORK":
+                    handled = True
+                    await handle_check_work_progress(update, context, state)
                     return
 
                 if data == "MENU_INN":
