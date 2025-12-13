@@ -5216,42 +5216,44 @@ async def send_city_menu(
         return
     features = CITY_FEATURES.get(state.location, {})
     lines = [
-        f"=== {loc['name']} ===",
-        f"Rekomendasi level: Lv {loc['min_level']}+",
+        f"=== {loc['name'].upper()} ===",
+        f"Level minimum: {loc['min_level']}",
+        "",
     ]
     description = features.get("description")
     if description:
         lines.append(description)
-    lines.append(f"Gold saat ini: {state.gold}")
+        lines.append("")
+    lines.append(f"Gold: {state.gold}")
     if extra_text:
         lines.append("")
         lines.append(extra_text)
     lines.append("")
-    lines.append("Apa yang ingin kamu lakukan?")
+    lines.append("Pilih menu:")
     text = "\n".join(lines)
 
     choices = [
-        ("Lihat status party", "MENU_STATUS"),
-        ("Kelola Equipment", "MENU_EQUIPMENT"),
+        ("Status Party", "MENU_STATUS"),
+        ("Equipment", "MENU_EQUIPMENT"),
         ("Inventory", "MENU_INVENTORY"),
     ]
     if loc.get("has_shop"):
-        choices.append(("Pergi ke toko", "MENU_SHOP"))
+        choices.append(("Toko", "MENU_SHOP"))
     
     # Crafting tersedia di semua kota kecuali Kampar (cursed)
     if state.location != "KAMPAR":
-        choices.append(("Bengkel Crafting", "MENU_CRAFTING"))
+        choices.append(("Crafting", "MENU_CRAFTING"))
     
     if loc.get("has_guild"):
-        choices.append(("Pergi ke guild (Quest)", "MENU_GUILD"))
+        choices.append(("Guild Quest", "MENU_GUILD"))
         # Jobs hanya di kota dengan guild
-        choices.append(("Guild Pekerjaan", "MENU_JOBS"))
+        choices.append(("Pekerjaan", "MENU_JOBS"))
     
     if loc.get("has_inn"):
-        choices.append(("Ke penginapan (heal)", "MENU_INN"))
+        choices.append(("Penginapan", "MENU_INN"))
     if loc.get("has_clinic"):
-        choices.append(("Pergi ke klinik", "MENU_CLINIC"))
-    choices.append(("Pergi hunting", "MENU_HUNTING"))
+        choices.append(("Klinik", "MENU_CLINIC"))
+    choices.append(("Hunting", "MENU_HUNTING"))
 
     # Event / side quest per kota
     if state.location == "SIAK":
@@ -5478,11 +5480,17 @@ async def send_shop_menu(
         return
     features = CITY_FEATURES.get(state.location, {})
     shop_items = features.get("shop_items", [])
-    lines = [f"🏪 Toko di {loc_info['name']}", f"Gold-mu saat ini: {state.gold}"]
+    lines = [
+        f"=== TOKO {loc_info['name'].upper()} ===",
+        f"Gold: {state.gold}",
+        "",
+        "Silakan pilih kategori barang:"
+    ]
     buttons = [
-        [InlineKeyboardButton("🛒 Beli barang", callback_data="SHOP_BUY")],
-        [InlineKeyboardButton("💰 Jual barang", callback_data="SHOP_SELL")],
-        [InlineKeyboardButton("⬅ Kembali", callback_data="BACK_CITY_MENU")],
+        [InlineKeyboardButton("Beli Equipment", callback_data="SHOP_BUY_EQUIPMENT")],
+        [InlineKeyboardButton("Beli Item Consumable", callback_data="SHOP_BUY_CONSUMABLE")],
+        [InlineKeyboardButton("Jual Barang", callback_data="SHOP_SELL")],
+        [InlineKeyboardButton("Kembali", callback_data="BACK_CITY_MENU")],
     ]
     text = "\n".join(lines)
     markup = InlineKeyboardMarkup(buttons)
@@ -5499,11 +5507,11 @@ async def send_hunting_menu(
     extra_text: str = "",
 ):
     hero_level = highest_party_level(state)
-    lines = ["=== AREA HUNTING ===", f"Level party tertinggi: {hero_level}"]
+    lines = ["=== AREA HUNTING ===", f"Level tertinggi party: {hero_level}", ""]
     if extra_text:
-        lines.append("")
         lines.append(extra_text)
-    lines.append("")
+        lines.append("")
+    lines.append("Pilih area:")
     buttons: List[List[InlineKeyboardButton]] = []
     for area_id, info in sorted(
         HUNTING_AREAS.items(), key=lambda item: item[1].get("min_level", 1)
@@ -5514,7 +5522,7 @@ async def send_hunting_menu(
             else f"Butuh Lv {info.get('min_level', 1)}"
         )
         lines.append(
-            f"- {info['name']} ({info['level_range']}, elemen {info['element']}) → {status}"
+            f"- {info['name']} ({info['level_range']}, {info['element']}) - {status}"
         )
         if hero_level >= info.get("min_level", 1):
             buttons.append(
@@ -5524,7 +5532,7 @@ async def send_hunting_menu(
                     )
                 ]
             )
-    buttons.append([InlineKeyboardButton("⬅ Kembali", callback_data="BACK_CITY_MENU")])
+    buttons.append([InlineKeyboardButton("Kembali ke Kota", callback_data="BACK_CITY_MENU")])
     markup = InlineKeyboardMarkup(buttons)
     text = "\n".join(lines)
     query = update.callback_query
@@ -5588,7 +5596,7 @@ async def send_hunting_area_menu(
         buttons.append(
             [
                 InlineKeyboardButton(
-                    "⛔ Hentikan Auto Hunting", callback_data="AUTO_HUNT_OFF"
+                    "Hentikan Auto Hunting", callback_data="AUTO_HUNT_OFF"
                 )
             ]
         )
@@ -5596,15 +5604,15 @@ async def send_hunting_area_menu(
         buttons.append(
             [
                 InlineKeyboardButton(
-                    "⚔️ Auto Hunting", callback_data=f"AUTO_HUNT_ON|{area_id}"
+                    "Mulai Auto Hunting", callback_data=f"AUTO_HUNT_ON|{area_id}"
                 )
             ]
         )
     buttons.append(
-        [InlineKeyboardButton("⬅ Daftar Area", callback_data="MENU_HUNTING")]
+        [InlineKeyboardButton("Daftar Area", callback_data="MENU_HUNTING")]
     )
     buttons.append(
-        [InlineKeyboardButton("🏘️ Kembali ke kota", callback_data="BACK_CITY_MENU")]
+        [InlineKeyboardButton("Kembali ke Kota", callback_data="BACK_CITY_MENU")]
     )
     markup = InlineKeyboardMarkup(buttons)
     query = update.callback_query
@@ -6025,7 +6033,7 @@ async def send_auto_hunt_state(
         [
             [
                 InlineKeyboardButton(
-                    "⛔ Hentikan Auto Hunting", callback_data="AUTO_HUNT_OFF"
+                    "Hentikan Auto Hunting", callback_data="AUTO_HUNT_OFF"
                 )
             ]
         ]
@@ -6392,21 +6400,55 @@ async def run_auto_hunt_loop(
 
 
 async def send_shop_buy_menu(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, state: GameState
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: GameState, category: str = "ALL"
 ):
+    """
+    Tampilkan menu beli dengan kategori
+    category: "EQUIPMENT", "CONSUMABLE", atau "ALL"
+    """
     query = update.callback_query
     features = CITY_FEATURES.get(state.location, {})
     shop_items = features.get("shop_items", [])
-    lines = ["Daftar barang yang dijual:", f"Gold: {state.gold}"]
-    buttons: List[List[InlineKeyboardButton]] = []
-    if not shop_items:
-        lines.append("Toko ini sedang kosong.")
+    
+    # Filter berdasarkan kategori
+    filtered_items = []
+    for item_id in shop_items:
+        item = ITEMS.get(item_id)
+        if not item:
+            continue
+        item_type = item.get("type", "")
+        if category == "EQUIPMENT" and item_type in ["weapon", "armor"]:
+            filtered_items.append((item_id, item))
+        elif category == "CONSUMABLE" and item_type == "consumable":
+            filtered_items.append((item_id, item))
+        elif category == "ALL":
+            filtered_items.append((item_id, item))
+    
+    # Header berdasarkan kategori
+    if category == "EQUIPMENT":
+        header = "=== EQUIPMENT ==="
+    elif category == "CONSUMABLE":
+        header = "=== ITEM CONSUMABLE ==="
     else:
-        for item_id in shop_items:
-            item = ITEMS.get(item_id)
-            if not item:
-                continue
-            lines.append(f"- {item['name']} ({item['buy_price']} Gold)")
+        header = "=== SEMUA BARANG ==="
+    
+    lines = [header, f"Gold: {state.gold}", ""]
+    buttons: List[List[InlineKeyboardButton]] = []
+    
+    if not filtered_items:
+        lines.append("Tidak ada barang di kategori ini.")
+    else:
+        for item_id, item in filtered_items:
+            item_type_label = ""
+            if item.get("type") == "weapon":
+                item_type_label = " [Senjata]"
+            elif item.get("type") == "armor":
+                item_type_label = " [Armor]"
+            
+            lines.append(f"- {item['name']}{item_type_label} - {item['buy_price']} Gold")
+            if item.get("description"):
+                lines.append(f"  {item['description']}")
+            
             buttons.append(
                 [
                     InlineKeyboardButton(
@@ -6414,7 +6456,8 @@ async def send_shop_buy_menu(
                     )
                 ]
             )
-    buttons.append([InlineKeyboardButton("⬅ Kembali", callback_data="MENU_SHOP")])
+    
+    buttons.append([InlineKeyboardButton("Kembali", callback_data="MENU_SHOP")])
     markup = InlineKeyboardMarkup(buttons)
     if query:
         await safe_edit_text(query, "\n".join(lines), reply_markup=markup)
@@ -6425,10 +6468,15 @@ async def send_shop_buy_menu(
 async def send_shop_sell_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE, state: GameState
 ):
+    """Tampilkan menu jual dengan kategori terpisah"""
     query = update.callback_query
-    lines = ["Pilih item yang ingin dijual:", f"Gold: {state.gold}"]
-    buttons: List[List[InlineKeyboardButton]] = []
-    any_item = False
+    lines = ["=== JUAL BARANG ===", f"Gold: {state.gold}", ""]
+    
+    # Kelompokkan berdasarkan kategori
+    equipment_items = []
+    consumable_items = []
+    other_items = []
+    
     for item_id, qty in sorted(state.inventory.items()):
         if qty <= 0:
             continue
@@ -6438,18 +6486,67 @@ async def send_shop_sell_menu(
         sell_price = item.get("sell_price", 0)
         if sell_price <= 0:
             continue
+        
+        item_type = item.get("type", "")
+        if item_type in ["weapon", "armor"]:
+            equipment_items.append((item_id, item, qty, sell_price))
+        elif item_type == "consumable":
+            consumable_items.append((item_id, item, qty, sell_price))
+        else:
+            other_items.append((item_id, item, qty, sell_price))
+    
+    buttons: List[List[InlineKeyboardButton]] = []
+    any_item = False
+    
+    # Tampilkan Equipment
+    if equipment_items:
         any_item = True
-        lines.append(f"- {item['name']} x{qty} (jual {sell_price} Gold)")
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    f"Jual {item['name']}", callback_data=f"SELL_ITEM|{item_id}"
-                )
-            ]
-        )
+        lines.append("EQUIPMENT:")
+        for item_id, item, qty, sell_price in equipment_items:
+            type_label = "Senjata" if item.get("type") == "weapon" else "Armor"
+            lines.append(f"- {item['name']} [{type_label}] x{qty} - {sell_price} Gold")
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"Jual {item['name']}", callback_data=f"SELL_ITEM|{item_id}"
+                    )
+                ]
+            )
+        lines.append("")
+    
+    # Tampilkan Consumables
+    if consumable_items:
+        any_item = True
+        lines.append("CONSUMABLE:")
+        for item_id, item, qty, sell_price in consumable_items:
+            lines.append(f"- {item['name']} x{qty} - {sell_price} Gold")
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"Jual {item['name']}", callback_data=f"SELL_ITEM|{item_id}"
+                    )
+                ]
+            )
+        lines.append("")
+    
+    # Tampilkan Other
+    if other_items:
+        any_item = True
+        lines.append("LAINNYA:")
+        for item_id, item, qty, sell_price in other_items:
+            lines.append(f"- {item['name']} x{qty} - {sell_price} Gold")
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"Jual {item['name']}", callback_data=f"SELL_ITEM|{item_id}"
+                    )
+                ]
+            )
+    
     if not any_item:
         lines.append("Tidak ada item yang bisa dijual.")
-    buttons.append([InlineKeyboardButton("⬅ Kembali", callback_data="MENU_SHOP")])
+    
+    buttons.append([InlineKeyboardButton("Kembali", callback_data="MENU_SHOP")])
     markup = InlineKeyboardMarkup(buttons)
     if query:
         await safe_edit_text(query, "\n".join(lines), reply_markup=markup)
@@ -7260,25 +7357,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         lines = [
-            "✨ Legends of Aruna: Journey to Kampar",
+            "Legends of Aruna: Journey to Kampar",
             "RPG teks taktis tentang ksatria abadi yang menebus kegagalannya melawan Zabx.",
             "",
             "==============================",
             "Perintah Utama:",
-            "• /start – Mulai petualangan atau lanjutkan dari progress terakhir.",
-            "• /status – Lihat status party dan kondisi terkini.",
-            "• /map – Buka peta dunia dan pilih kota atau hutan.",
-            "• /inventory – Lihat dan gunakan item di luar battle.",
-            "• /save – Simpan progress secara manual.",
-            "• /load – Muat progress dari file save.",
-            "• /quests – Lihat quest guild dan progres cerita.",
-            "• /help – Lihat bantuan ini.",
+            "/start - Mulai petualangan atau lanjutkan dari progress terakhir",
+            "/status - Lihat status party dan kondisi terkini",
+            "/map - Buka peta dunia dan pilih kota atau hutan",
+            "/inventory - Lihat dan gunakan item di luar battle",
+            "/stop_hunt - Hentikan auto hunting yang sedang berjalan",
+            "/save - Simpan progress secara manual",
+            "/load - Muat progress dari file save",
+            "/quests - Lihat quest guild dan progres cerita",
+            "/help - Lihat bantuan ini",
             "",
             "==============================",
             "Tips Singkat:",
-            "• Gunakan menu Hunting untuk memilih area dan menyalakan auto hunting.",
-            "• Kunjungi Guild di tiap kota besar untuk kontrak berburu dan hadiah tambahan.",
-            "• Kampar dan Kastil Zabx sangat berbahaya – selesaikan quest karakter dan pedang warisan sebelum maju.",
+            "Gunakan menu Hunting untuk memilih area dan menyalakan auto hunting.",
+            "Kunjungi Guild di tiap kota besar untuk kontrak berburu dan hadiah tambahan.",
+            "Kampar dan Kastil Zabx sangat berbahaya, selesaikan quest karakter dan pedang warisan sebelum maju.",
         ]
         text = "\n".join(lines)
         if update.message:
@@ -7470,6 +7568,43 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def stop_hunt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command untuk menghentikan auto hunting"""
+    user_id = update.effective_user.id
+    try:
+        async with get_user_lock(user_id):
+            state = get_game_state(user_id)
+            
+            # Cek apakah sedang auto hunting
+            if not state.auto_hunt:
+                if update.message:
+                    await update.message.reply_text(
+                        "Auto hunting tidak sedang berjalan."
+                    )
+                return
+            
+            # Hentikan auto hunting
+            logger.info("User %s menghentikan auto hunting via command", user_id)
+            state.auto_hunt = False
+            
+            if state.auto_hunt_session:
+                await state.auto_hunt_session.stop("Dihentikan via command /stop_hunt")
+            
+            # Reset state
+            reset_auto_hunt_state(state)
+            
+            if update.message:
+                await update.message.reply_text(
+                    "Auto hunting telah dihentikan. Gunakan /map untuk kembali ke peta atau /status untuk melihat kondisi party."
+                )
+    except Exception:
+        logger.exception("Error di handler /stop_hunt untuk user %s", user_id)
+        if update.message:
+            await update.message.reply_text(
+                "Terjadi kesalahan saat menghentikan auto hunting."
+            )
+
+
 async def map_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     try:
@@ -7483,6 +7618,9 @@ async def map_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         async with get_user_lock(user_id):
             state = get_game_state(user_id)
+            # Hentikan auto hunting jika aktif saat membuka map
+            if state.auto_hunt:
+                reset_auto_hunt_state(state)
         await send_world_map(update, context, state)
     except Exception:
         logger.exception("Error di handler /map untuk user %s", user_id)
@@ -7758,7 +7896,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         return
                     if state.auto_hunt:
                         await query.answer(
-                            "Kamu sedang auto hunting. Tekan '⛔ Hentikan Auto Hunting' untuk kembali ke mode manual.",
+                            "Kamu sedang auto hunting. Tekan 'Hentikan Auto Hunting' untuk kembali ke mode manual atau gunakan /stop_hunt.",
                             show_alert=True,
                         )
                         return
@@ -7778,7 +7916,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         return
                     if state.auto_hunt:
                         await query.answer(
-                            "Kamu sedang auto hunting. Tekan '⛔ Hentikan Auto Hunting' untuk kembali ke mode manual.",
+                            "Kamu sedang auto hunting. Tekan 'Hentikan Auto Hunting' untuk kembali ke mode manual atau gunakan /stop_hunt.",
                             show_alert=True,
                         )
                         return
@@ -7797,7 +7935,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         return
                     if state.auto_hunt:
                         await query.answer(
-                            "Kamu sedang auto hunting. Tekan '⛔ Hentikan Auto Hunting' untuk kembali ke mode manual.",
+                            "Kamu sedang auto hunting. Tekan 'Hentikan Auto Hunting' untuk kembali ke mode manual atau gunakan /stop_hunt.",
                             show_alert=True,
                         )
                         return
@@ -7811,7 +7949,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         return
                     if state.auto_hunt:
                         await query.answer(
-                            "Kamu sedang auto hunting. Tekan '⛔ Hentikan Auto Hunting' untuk kembali ke mode manual.",
+                            "Kamu sedang auto hunting. Tekan 'Hentikan Auto Hunting' untuk kembali ke mode manual atau gunakan /stop_hunt.",
                             show_alert=True,
                         )
                         return
@@ -8020,7 +8158,15 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 if data == "SHOP_BUY":
                     handled = True
-                    await send_shop_buy_menu(update, context, state)
+                    await send_shop_buy_menu(update, context, state, "ALL")
+                    return
+                if data == "SHOP_BUY_EQUIPMENT":
+                    handled = True
+                    await send_shop_buy_menu(update, context, state, "EQUIPMENT")
+                    return
+                if data == "SHOP_BUY_CONSUMABLE":
+                    handled = True
+                    await send_shop_buy_menu(update, context, state, "CONSUMABLE")
                     return
                 if data == "SHOP_SELL":
                     handled = True
@@ -8316,6 +8462,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CommandHandler("map", map_cmd))
+    application.add_handler(CommandHandler("stop_hunt", stop_hunt_cmd))
     application.add_handler(CommandHandler("save", save_cmd))
     application.add_handler(CommandHandler("load", load_cmd))
     application.add_handler(CommandHandler("inventory", inventory_cmd))
